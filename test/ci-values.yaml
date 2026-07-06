@@ -29,7 +29,7 @@ scylladb:
       export SCYLLADB_BROADCAST_ADDRESS=${POD_NAME}-internal
       /opt/bitnami/scripts/scylladb/entrypoint.sh /opt/bitnami/scripts/scylladb/run.sh \
         --alternator-port=8000 --alternator-write-isolation=always \
-        --smp=1 --memory=1G --overprovisioned
+        --smp=1 --memory=1G --reserve-memory=0M --overprovisioned
 
 validator:
   # Image is built and `kind load`-ed by the CI job, so pull from the node.
