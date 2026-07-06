@@ -5,8 +5,19 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-  # Keep the validator's npm dependencies patched.
+    groups:
+      actions:
+        patterns: ["*"]
+  # Keep the validator's npm dependencies patched, grouped into one PR.
   - package-ecosystem: npm
     directory: "/validator"
     schedule:
       interval: weekly
+    groups:
+      validator-deps:
+        patterns: ["*"]
+    ignore:
+      # @types/node tracks the Node runtime (node:20-alpine); do not jump its
+      # major ahead of the runtime.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
