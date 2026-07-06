@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Keep the SHA-pinned GitHub Actions current.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+  # Keep the validator's npm dependencies patched.
+  - package-ecosystem: npm
+    directory: "/validator"
+    schedule:
+      interval: weekly
