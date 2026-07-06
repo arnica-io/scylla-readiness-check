@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  # helm test streams logs from a Pod whose name matches this hook resource,
+  # so the validator MUST be a bare Pod (not a Job, whose pod gets a random
+  # suffix) for `helm test --logs` to work.
+  name: {{ include "scylla-readiness-check.fullname" . }}-validator
+  labels:
+    {{- include "scylla-readiness-check.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-weight: "0"
+    # Keep the Pod after the run so `helm test --logs` works; it is replaced
+    # on the next test run.
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  restartPolicy: Never
+  # Bound the run even if the validator hangs (validator.timeoutSeconds + slack).
+  activeDeadlineSeconds: {{ add .Values.validator.timeoutSeconds 300 }}
+  serviceAccountName: scylla-readiness-validator
+  containers:
+    - name: validator
+      image: {{ .Values.validator.image }}
+      imagePullPolicy: {{ .Values.validator.imagePullPolicy }}
+      resources:
+        {{- toYaml .Values.validator.resources | nindent 8 }}
+      env:
+        - name: SCYLLA_ENDPOINT
+          value: "http://scylladb:8000"
+        - name: TIMEOUT_SECONDS
+          value: {{ .Values.validator.timeoutSeconds | quote }}
+        - name: SCYLLA_SELECTOR
+          value: "app.kubernetes.io/name=scylladb"
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        # Dummy credentials — Alternator does not enforce auth in this POC,
+        # but AWS SDKs require them to be set.
+        - name: AWS_ACCESS_KEY_ID
+          value: "readiness"
+        - name: AWS_SECRET_ACCESS_KEY
+          value: "readiness"
+        - name: AWS_DEFAULT_REGION
+          value: "us-east-1"
