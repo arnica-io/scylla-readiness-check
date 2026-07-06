@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  lint-and-template:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      # The scylladb subchart is vendored as a .tgz in charts/, so no
+      # external repo access is needed for lint/template.
+      - name: Helm lint
+        run: helm lint .
+
+      - name: Helm template (catch template errors)
+        run: helm template rc . > /dev/null
+
+  # kind-smoke is best-effort: pulling the bitnamilegacy/scylladb image and
+  # ScyllaDB's resource requirements may exceed what a small GitHub-hosted
+  # runner can provide. If this job proves flaky, add `continue-on-error: true`
+  # to make it non-blocking rather than deleting it.
+  kind-smoke:
+    runs-on: ubuntu-latest
+    needs: lint-and-template
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      # kind ships with a local-path (standard) StorageClass by default,
+      # which satisfies the chart's block-storage requirement.
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+
+      - name: Install chart
+        run: |
+          helm install rc . \
+            -n scylla-readiness \
+            --create-namespace \
+            --set validator.timeoutSeconds=600
+
+      # Do NOT swallow the exit code here: if the validator fails, the job
+      # must fail so we see the result. --logs prints the PASS/FAIL report.
+      - name: Run readiness test
+        run: helm test rc -n scylla-readiness --logs
+
+      - name: Show pods
+        if: always()
+        run: kubectl get pods -A
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          kubectl describe pods -n scylla-readiness || true
+          kubectl get events -n scylla-readiness --sort-by=.lastTimestamp || true
+          for pod in $(kubectl get pods -n scylla-readiness -o name); do
+            echo "===== Logs: ${pod} ====="
+            kubectl logs -n scylla-readiness "${pod}" --all-containers --tail=200 || true
+          done

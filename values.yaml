@@ -1,0 +1,79 @@
+# -----------------------------------------------------------------------------
+# scylla-readiness-check — preflight / readiness POC chart
+#
+# This chart deploys a single-node ScyllaDB (Bitnami subchart) with the
+# Alternator (DynamoDB-compatible) API enabled, plus a `helm test` validator
+# Job that proves the cluster can run it. It is a proof-of-concept sizing —
+# NOT a production topology.
+#
+# IMPORTANT: ScyllaDB does NOT support NFS-backed storage. Make sure the
+# storage class used below (cluster default when empty) provisions block
+# storage (e.g. local SSD, EBS, Ceph RBD, Longhorn), not NFS.
+# -----------------------------------------------------------------------------
+
+scylladb:
+  enabled: true
+  # Deterministic service DNS: service name "scylladb", Alternator at
+  # http://scylladb:8000 — the validator Job depends on this.
+  fullnameOverride: scylladb
+  replicaCount: 1                 # POC (prod is 3)
+  resourcesPreset: "small"
+  image:
+    repository: bitnamilegacy/scylladb
+  persistence:
+    # Empty = cluster default storage class. NFS is unsupported by ScyllaDB —
+    # use a block-storage class.
+    storageClass: ""
+    size: 10Gi
+  sysctl:
+    enabled: true
+    image:
+      repository: bitnamilegacy/os-shell
+  networkPolicy:
+    enabled: false
+  dbUser:
+    user: arnica
+    forcePassword: false
+    password: arnica
+  extraContainerPorts:
+    - containerPort: 8000
+      name: alternator
+  service:
+    extraPorts:
+      - name: alternator
+        port: 8000
+        nodePort: null
+  cluster:
+    seedCount: 1
+  command:
+    - bash
+    - -ec
+    - |
+      if [[ $POD_NAME =~ (.*)-0$ ]]; then
+          echo "Setting node as password seeder"
+          export SCYLLADB_PASSWORD_SEEDER=yes
+      else
+          export SCYLLADB_IGNORE_INITDB_SCRIPTS=1
+      fi
+      export SCYLLADB_BROADCAST_ADDRESS=${POD_NAME}-internal
+      /opt/bitnami/scripts/scylladb/entrypoint.sh /opt/bitnami/scripts/scylladb/run.sh --alternator-port=8000 --alternator-write-isolation=always
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: scylladb
+            topologyKey: kubernetes.io/hostname
+          weight: 1
+
+# Validator Job run by `helm test` — exercises the Alternator API end to end.
+validator:
+  image: ghcr.io/arnica-io/scylla-readiness-validator:0.1.0
+  imagePullPolicy: IfNotPresent
+  # How long the validator waits for ScyllaDB to come up and the checks to pass.
+  timeoutSeconds: 1200
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi

@@ -1,0 +1,21 @@
+apiVersion: v2
+name: scylla-readiness-check
+description: Preflight readiness check that deploys ScyllaDB and validates the Alternator (DynamoDB-compatible) API works on your cluster.
+type: application
+version: 0.1.0
+appVersion: "6.0"
+home: https://github.com/arnica-io/scylla-readiness-check
+keywords:
+  - scylladb
+  - alternator
+  - dynamodb
+  - on-prem
+  - readiness
+  - preflight
+maintainers:
+  - name: Arnica
+dependencies:
+  - name: scylladb
+    version: 2.0.3
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: scylladb.enabled

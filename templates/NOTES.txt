@@ -1,0 +1,17 @@
+Thank you for installing {{ .Chart.Name }}.
+
+ScyllaDB is now starting up. To run the readiness check, copy and paste
+this command:
+
+    helm test {{ .Release.Name }} -n {{ .Release.Namespace }} --logs
+
+This will print a PASS/FAIL summary of the check. If ScyllaDB did not come
+up within {{ .Values.validator.timeoutSeconds }} seconds, it prints the startup
+logs instead so we can see what went wrong.
+
+Please copy the full output of that command and send it to your Arnica
+contact.
+
+When you are done, clean everything up with:
+
+    helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}
