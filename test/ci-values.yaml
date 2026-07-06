@@ -1,0 +1,35 @@
+# CI-only overlay for the kind-smoke job.
+#
+# A GitHub-hosted runner has ~2 vCПU / 7 GB, so the production 3-node
+# topology cannot bootstrap here. This overlay runs a SINGLE ScyllaDB node
+# in developer mode (relaxed aio/hugepage/overcommit checks) purely to smoke
+# the chart + validator + Alternator functional path. QUORUM behaviour is
+# covered on a real cluster by test/TESTPLAN.md, not in CI.
+scylladb:
+  replicaCount: 1
+  cluster:
+    seedCount: 1
+  resourcesPreset: "none"
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  # Single seed node + developer mode so ScyllaDB starts on a small runner.
+  command:
+    - bash
+    - -ec
+    - |
+      export SCYLLADB_PASSWORD_SEEDER=yes
+      export SCYLLADB_BROADCAST_ADDRESS=${POD_NAME}-internal
+      /opt/bitnami/scripts/scylladb/entrypoint.sh /opt/bitnami/scripts/scylladb/run.sh \
+        --alternator-port=8000 --alternator-write-isolation=always \
+        --developer-mode=1 --smp=1 --memory=1G --overprovisioned=1
+
+validator:
+  # Image is built and `kind load`-ed by the CI job, so pull from the node.
+  image: scylla-readiness-validator:ci
+  imagePullPolicy: Never
+  timeoutSeconds: 420

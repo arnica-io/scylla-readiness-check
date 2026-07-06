@@ -42,18 +42,30 @@ jobs:
       # which satisfies the chart's block-storage requirement.
       - name: Create kind cluster
         uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          cluster_name: chart-ci
 
+      # Build the validator image and load it into the kind node, so the test
+      # Job can run it without a published GHCR image (imagePullPolicy: Never).
+      - name: Build validator image
+        run: docker build -t scylla-readiness-validator:ci validator/
+
+      - name: Load validator image into kind
+        run: kind load docker-image scylla-readiness-validator:ci --name chart-ci
+
+      # Single-node developer-mode overlay so ScyllaDB fits a small runner.
       - name: Install chart
         run: |
           helm install rc . \
             -n scylla-readiness \
             --create-namespace \
-            --set validator.timeoutSeconds=600
+            -f test/ci-values.yaml
 
-      # Do NOT swallow the exit code here: if the validator fails, the job
-      # must fail so we see the result. --logs prints the PASS/FAIL report.
+      # Do NOT swallow the exit code: if the validator fails, the job must
+      # fail so we see the result. --timeout MUST exceed validator.timeoutSeconds
+      # (420s in ci-values), or `helm test` aborts while the Job is still running.
       - name: Run readiness test
-        run: helm test rc -n scylla-readiness --logs
+        run: helm test rc -n scylla-readiness --logs --timeout 12m
 
       - name: Show pods
         if: always()
