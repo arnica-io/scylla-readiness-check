@@ -414,10 +414,47 @@ async function runFunctionalTests(client: DynamoDBClient): Promise<never> {
     process.exit(1);
   }
 
-  console.log(
-    "\nRESULT: PASS — cluster can run Arnica's ScyllaDB workload (QUORUM verified).",
-  );
+  // Report the real topology so the quorum claim is honest: a consistent
+  // read on a single node (RF1) is only a trivial quorum-of-one.
+  const nodes = await countReadyScyllaNodes();
+  let topology: string;
+  if (nodes === null) {
+    topology = 'node count unknown (could not query the Kubernetes API)';
+  } else if (nodes >= 3) {
+    topology = `${nodes} nodes — QUORUM verified (RF3, tolerates 1 node loss)`;
+  } else if (nodes === 2) {
+    topology = `${nodes} nodes — quorum active (RF2, no failure tolerance)`;
+  } else {
+    topology = `${nodes} node — single-node (RF1); QUORUM was NOT exercised`;
+  }
+
+  console.log("\nRESULT: PASS — cluster can run Arnica's ScyllaDB workload.");
+  console.log(`Topology: ${topology}.`);
   process.exit(0);
+}
+
+// Count ScyllaDB pods that are Ready, to report the real topology in the
+// PASS summary. Returns null if the Kubernetes API cannot be reached.
+async function countReadyScyllaNodes(): Promise<number | null> {
+  try {
+    const kc = new KubeConfig();
+    kc.loadFromCluster();
+    const core = kc.makeApiClient(CoreV1Api);
+    const podList = await core.listNamespacedPod({
+      namespace: NAMESPACE,
+      labelSelector: SCYLLA_SELECTOR,
+    });
+    let ready = 0;
+    for (const pod of podList.items) {
+      const isReady = (pod.status?.conditions ?? []).some(
+        (c) => c.type === 'Ready' && c.status === 'True',
+      );
+      if (isReady) ready++;
+    }
+    return ready;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
