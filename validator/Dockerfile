@@ -4,12 +4,15 @@
 #   docker build -t scylla-readiness-validator ./validator
 
 # ---- Stage 1: build ----
-FROM node:20-alpine AS build
+# Pin the build stage to the native builder platform so `npm ci` + `tsc` run
+# natively (not under QEMU emulation) during multi-arch builds. The runtime
+# deps are pure JavaScript (no native addons), so the resulting node_modules
+# is architecture-agnostic and safe to copy into any target-arch runtime.
+FROM --platform=$BUILDPLATFORM node:20-alpine AS build
 WORKDIR /app
 
-# No package-lock.json is committed, so use `npm install` (not `npm ci`).
-COPY package.json ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci
 
 COPY tsconfig.json ./
 COPY src ./src
