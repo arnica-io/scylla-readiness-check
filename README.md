@@ -4,10 +4,10 @@
 
 This is a small, self-contained Helm chart that answers one question: **can your Kubernetes cluster run Arnica's ScyllaDB workload?**
 
-When you install it, the chart deploys a single-node ScyllaDB instance into a namespace of your choice. Running `helm test` then executes a validator that checks two things:
+When you install it, the chart deploys a **3-node ScyllaDB cluster** into a namespace of your choice (three nodes give replication factor 3, so the check exercises real **QUORUM** reads/writes — not a single-node shortcut). Running `helm test` then executes a validator that checks two things:
 
-1. **ScyllaDB comes up** — the database starts and becomes healthy on your cluster's storage and compute.
-2. **The Alternator API works** — ScyllaDB's DynamoDB-compatible API responds correctly to the operations Arnica uses: create table, put item, get item, query, batch write, TTL, and delete.
+1. **ScyllaDB comes up** — all nodes start, form a cluster, and become healthy on your cluster's storage and compute.
+2. **The Alternator API works** — ScyllaDB's DynamoDB-compatible API responds correctly, at QUORUM consistency, to the operations Arnica uses: create table, put item, get item (consistent read), query (consistent read), batch write, TTL, and delete. The validator uses the same `@aws-sdk/client-dynamodb` driver Arnica's app uses.
 
 At the end you get a clear **PASS/FAIL summary** in your terminal. You copy that output and send it to your Arnica contact — that's it. Nothing is sent anywhere automatically.
 
@@ -63,7 +63,7 @@ All settings are optional. Override them with `--set key=value` on the install c
 | `scylladb.persistence.storageClass` | cluster default | StorageClass used for the ScyllaDB data volume. Must be block storage — NFS is unsupported. |
 | `scylladb.persistence.size` | chart default | Size of the persistent volume requested for ScyllaDB. |
 | `scylladb.resourcesPreset` | chart default | CPU/memory sizing preset for the ScyllaDB pod. |
-| `scylladb.replicaCount` | `1` | Number of ScyllaDB nodes. One node is enough for the readiness check. |
+| `scylladb.replicaCount` | `3` | Number of ScyllaDB nodes. 3 gives RF3/QUORUM (matches prod). Set to 1 for a lightweight non-quorum check. |
 
 Example — longer timeout and an explicit storage class:
 
@@ -98,7 +98,7 @@ Releases are automated by the tag-triggered GitHub Actions workflow (`.github/wo
 **Build and push the validator image:**
 
 ```bash
-docker build -t ghcr.io/arnica-io/scylla-readiness-validator:X.Y.Z -f validator/Dockerfile .
+docker build -t ghcr.io/arnica-io/scylla-readiness-validator:X.Y.Z validator/
 docker push ghcr.io/arnica-io/scylla-readiness-validator:X.Y.Z
 ```
 

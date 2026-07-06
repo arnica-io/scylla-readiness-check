@@ -1,24 +1,34 @@
 # ScyllaDB readiness validator image.
-# Build from the repo root:  docker build -f validator/Dockerfile .
-FROM alpine:3.20
+# NOTE: the docker build context must be the ./validator directory
+# (COPY paths below are relative to validator/, not the repo root):
+#   docker build -t scylla-readiness-validator ./validator
+
+# ---- Stage 1: build ----
+FROM node:20-alpine AS build
+WORKDIR /app
+
+# No package-lock.json is committed, so use `npm install` (not `npm ci`).
+COPY package.json ./
+RUN npm install
+
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+# Drop dev dependencies (typescript, @types/node) from node_modules.
+RUN npm prune --omit=dev
+
+# ---- Stage 2: runtime ----
+FROM node:20-alpine
+WORKDIR /app
+
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+
+# Run as a non-root user.
+RUN addgroup -g 10001 validator && adduser -D -u 10001 -G validator validator
+USER validator
 
 LABEL org.opencontainers.image.source=https://github.com/arnica-io/scylla-readiness-check
 
-# aws-cli and kubectl are both available in the Alpine community repository.
-# If `apk add kubectl` ever becomes unavailable on this Alpine version, swap it
-# for a direct binary download, e.g.:
-#   ARCH=$(apk --print-arch | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
-#   curl -fsSL -o /usr/local/bin/kubectl \
-#     "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl" && \
-#   chmod +x /usr/local/bin/kubectl
-RUN apk add --no-cache bash curl coreutils ca-certificates aws-cli kubectl
-
-# Build context is the repo root, so the script lives under validator/.
-COPY validator/check.sh /usr/local/bin/check.sh
-RUN chmod +x /usr/local/bin/check.sh
-
-# Non-root user: kubectl and aws-cli do not need root privileges.
-RUN adduser -D -u 10001 validator
-USER validator
-
-ENTRYPOINT ["/usr/local/bin/check.sh"]
+ENTRYPOINT ["node", "dist/check.js"]

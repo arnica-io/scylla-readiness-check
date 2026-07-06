@@ -1,0 +1,447 @@
+/**
+ * ScyllaDB readiness validator — runs as a Kubernetes `helm test` Job.
+ *
+ * PHASE 1  — wait (up to TIMEOUT_SECONDS) for ScyllaDB's Alternator
+ *            (DynamoDB-compatible) API to answer ListTables.
+ * PHASE 2a — if it never comes up: pull Kubernetes diagnostics (pod status,
+ *            events, logs) via the in-cluster API and exit 1.
+ * PHASE 2b — if it comes up: run functional DynamoDB tests at QUORUM
+ *            consistency and print a PASS/FAIL summary, exit 0/1.
+ *
+ * This intentionally uses @aws-sdk/client-dynamodb (v3) — the same driver
+ * Arnica's application uses — so the check reflects the real client path.
+ */
+
+import {
+  BatchWriteItemCommand,
+  CreateTableCommand,
+  DeleteTableCommand,
+  DynamoDBClient,
+  GetItemCommand,
+  ListTablesCommand,
+  PutItemCommand,
+  QueryCommand,
+  UpdateTimeToLiveCommand,
+  waitUntilTableExists,
+} from '@aws-sdk/client-dynamodb';
+import { CoreV1Api, KubeConfig } from '@kubernetes/client-node';
+
+// ---------------------------------------------------------------------------
+// Configuration (env vars provided by the Job, with safe defaults)
+// ---------------------------------------------------------------------------
+
+const SCYLLA_ENDPOINT = process.env.SCYLLA_ENDPOINT ?? 'http://scylladb:8000';
+const TIMEOUT_SECONDS = parseInt(process.env.TIMEOUT_SECONDS ?? '1200', 10);
+const SCYLLA_SELECTOR =
+  process.env.SCYLLA_SELECTOR ?? 'app.kubernetes.io/name=scylladb';
+const NAMESPACE = process.env.NAMESPACE ?? 'default';
+// Alternator requires credentials to be present but accepts any value.
+const AWS_ACCESS_KEY_ID = process.env.AWS_ACCESS_KEY_ID ?? 'readiness';
+const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY ?? 'readiness';
+const AWS_DEFAULT_REGION = process.env.AWS_DEFAULT_REGION ?? 'us-east-1';
+
+const POLL_INTERVAL_MS = 10_000;
+const HEARTBEAT_EVERY_MS = 30_000;
+
+// ---------------------------------------------------------------------------
+// Output helpers — plain ASCII; this output is read from `helm test --logs`
+// and pasted into email/Slack, so no colors or unicode decorations.
+// ---------------------------------------------------------------------------
+
+function banner(text: string): void {
+  const line = '='.repeat(72);
+  console.log(`\n${line}\n${text}\n${line}`);
+}
+
+function section(text: string): void {
+  console.log(`\n---- ${text} ${'-'.repeat(Math.max(1, 66 - text.length))}`);
+}
+
+function errorText(err: unknown): string {
+  if (err instanceof Error) {
+    return `${err.name}: ${err.message}`;
+  }
+  return String(err);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 1 — wait for Alternator to answer
+// ---------------------------------------------------------------------------
+
+interface ReadinessResult {
+  ready: boolean;
+  lastError: unknown;
+  elapsedSeconds: number;
+}
+
+async function waitForAlternator(client: DynamoDBClient): Promise<ReadinessResult> {
+  banner(
+    `PHASE 1 — waiting up to ${TIMEOUT_SECONDS}s for ScyllaDB Alternator at ${SCYLLA_ENDPOINT}`,
+  );
+
+  const start = Date.now();
+  let lastError: unknown = null;
+  let lastHeartbeat = 0;
+
+  for (;;) {
+    const elapsedMs = Date.now() - start;
+    const elapsedSeconds = Math.floor(elapsedMs / 1000);
+
+    if (elapsedSeconds >= TIMEOUT_SECONDS) {
+      return { ready: false, lastError, elapsedSeconds };
+    }
+
+    try {
+      await client.send(new ListTablesCommand({ Limit: 1 }));
+      console.log(`[PASS] alternator-reachable (after ${elapsedSeconds}s)`);
+      return { ready: true, lastError: null, elapsedSeconds };
+    } catch (err) {
+      lastError = err;
+    }
+
+    if (elapsedMs - lastHeartbeat >= HEARTBEAT_EVERY_MS) {
+      lastHeartbeat = elapsedMs;
+      const remaining = TIMEOUT_SECONDS - elapsedSeconds;
+      console.log(
+        `... still waiting for ScyllaDB (elapsed ${elapsedSeconds}s, remaining ${remaining}s) — last error: ${errorText(lastError)}`,
+      );
+    }
+
+    await sleep(POLL_INTERVAL_MS);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 2a — Kubernetes diagnostics on timeout
+// ---------------------------------------------------------------------------
+
+// NOTE for maintainers: this targets @kubernetes/client-node >= 1.0, whose
+// API methods take a single options object and return the response object
+// directly (e.g. `core.listNamespacedPod({ namespace })` returns V1PodList).
+// If you pin < 1.0, switch to positional args and unwrap `.body`.
+
+async function printPodStatuses(core: CoreV1Api): Promise<void> {
+  section(`Pods in ${NAMESPACE} matching "${SCYLLA_SELECTOR}"`);
+  try {
+    const podList = await core.listNamespacedPod({
+      namespace: NAMESPACE,
+      labelSelector: SCYLLA_SELECTOR,
+    });
+    if (podList.items.length === 0) {
+      console.log('(no pods matched the selector)');
+      return;
+    }
+    for (const pod of podList.items) {
+      const name = pod.metadata?.name ?? '<unnamed>';
+      const phase = pod.status?.phase ?? '<unknown>';
+      console.log(`pod: ${name}  phase: ${phase}`);
+      for (const cs of pod.status?.containerStatuses ?? []) {
+        console.log(
+          `  container: ${cs.name}  ready: ${cs.ready}  restarts: ${cs.restartCount}`,
+        );
+        if (cs.state?.waiting) {
+          console.log(
+            `    waiting: ${cs.state.waiting.reason ?? ''} ${cs.state.waiting.message ?? ''}`,
+          );
+        }
+        if (cs.state?.terminated) {
+          console.log(
+            `    terminated: ${cs.state.terminated.reason ?? ''} ${cs.state.terminated.message ?? ''}`,
+          );
+        }
+      }
+    }
+  } catch (err) {
+    console.log(`(failed to list pods: ${errorText(err)})`);
+  }
+}
+
+async function printRecentEvents(core: CoreV1Api): Promise<void> {
+  section(`Recent events in ${NAMESPACE} (last 50)`);
+  try {
+    const eventList = await core.listNamespacedEvent({ namespace: NAMESPACE });
+    const events = [...eventList.items].sort((a, b) => {
+      const ta = a.lastTimestamp ? new Date(a.lastTimestamp).getTime() : 0;
+      const tb = b.lastTimestamp ? new Date(b.lastTimestamp).getTime() : 0;
+      return ta - tb;
+    });
+    for (const ev of events.slice(-50)) {
+      const ts = ev.lastTimestamp
+        ? new Date(ev.lastTimestamp).toISOString()
+        : '<no-timestamp>';
+      console.log(
+        `${ts} ${ev.type ?? ''} ${ev.reason ?? ''} ${ev.involvedObject?.name ?? ''}: ${ev.message ?? ''}`,
+      );
+    }
+    if (events.length === 0) {
+      console.log('(no events found)');
+    }
+  } catch (err) {
+    console.log(`(failed to list events: ${errorText(err)})`);
+  }
+}
+
+async function printPodLogs(core: CoreV1Api): Promise<void> {
+  let podNames: string[] = [];
+  try {
+    const podList = await core.listNamespacedPod({
+      namespace: NAMESPACE,
+      labelSelector: SCYLLA_SELECTOR,
+    });
+    podNames = podList.items
+      .map((p) => p.metadata?.name)
+      .filter((n): n is string => typeof n === 'string');
+  } catch (err) {
+    console.log(`(failed to list pods for logs: ${errorText(err)})`);
+    return;
+  }
+
+  for (const name of podNames) {
+    section(`>>> logs: ${name}`);
+    try {
+      const logs = await core.readNamespacedPodLog({
+        name,
+        namespace: NAMESPACE,
+        tailLines: 200,
+      });
+      console.log(logs || '(empty log)');
+    } catch (err) {
+      console.log(`(failed to read logs: ${errorText(err)})`);
+    }
+    // Also try the previous container instance — useful for CrashLoopBackOff.
+    try {
+      const prevLogs = await core.readNamespacedPodLog({
+        name,
+        namespace: NAMESPACE,
+        tailLines: 200,
+        previous: true,
+      });
+      if (prevLogs) {
+        console.log(`>>> previous-instance logs: ${name}`);
+        console.log(prevLogs);
+      }
+    } catch {
+      // No previous instance — expected for pods that never restarted.
+    }
+  }
+}
+
+async function runDiagnosticsAndFail(lastError: unknown): Promise<never> {
+  banner(`SCYLLA DID NOT BECOME READY IN ${TIMEOUT_SECONDS}s — DIAGNOSTICS`);
+  console.log(`Last ListTables error: ${errorText(lastError)}`);
+
+  try {
+    const kc = new KubeConfig();
+    kc.loadFromCluster(); // in-cluster ServiceAccount token (RBAC granted by the chart)
+    const core = kc.makeApiClient(CoreV1Api);
+
+    await printPodStatuses(core);
+    await printRecentEvents(core);
+    await printPodLogs(core);
+  } catch (err) {
+    console.log(`(failed to initialize Kubernetes client: ${errorText(err)})`);
+  }
+
+  banner(
+    'RESULT: FAIL — ScyllaDB did not start. Send this entire output to your Arnica contact.',
+  );
+  process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 2b — functional DynamoDB tests at QUORUM
+// ---------------------------------------------------------------------------
+
+async function runFunctionalTests(client: DynamoDBClient): Promise<never> {
+  banner('PHASE 2 — functional DynamoDB (Alternator) tests at QUORUM');
+
+  const tableName = `readiness_check_${Date.now()}`;
+  console.log(`Using test table: ${tableName}`);
+
+  let pass = 0;
+  let total = 0;
+  const failed: string[] = [];
+  let tableDeleted = false;
+
+  async function check(name: string, fn: () => Promise<void>): Promise<void> {
+    total++;
+    try {
+      await fn();
+      pass++;
+      console.log(`[PASS] ${name}`);
+    } catch (err) {
+      failed.push(name);
+      console.log(`[FAIL] ${name}`);
+      console.log(`       ${errorText(err)}`);
+    }
+  }
+
+  try {
+    await check('createTable', async () => {
+      await client.send(
+        new CreateTableCommand({
+          TableName: tableName,
+          KeySchema: [{ AttributeName: 'id', KeyType: 'HASH' }],
+          AttributeDefinitions: [{ AttributeName: 'id', AttributeType: 'S' }],
+          BillingMode: 'PAY_PER_REQUEST',
+        }),
+      );
+    });
+
+    await check('waitTableActive', async () => {
+      await waitUntilTableExists(
+        { client, maxWaitTime: 120 },
+        { TableName: tableName },
+      );
+    });
+
+    await check('putItem', async () => {
+      await client.send(
+        new PutItemCommand({
+          TableName: tableName,
+          Item: {
+            id: { S: 'item1' },
+            payload: { S: 'hello-from-arnica' },
+          },
+        }),
+      );
+    });
+
+    // ConsistentRead: true maps to a QUORUM (CL=LOCAL_QUORUM) read on a
+    // multi-node ScyllaDB cluster. Combined with Alternator's
+    // write-isolation=always (which makes writes LWT), this exercises the
+    // quorum read/write path we want to prove works.
+    await check('getItemConsistent', async () => {
+      const res = await client.send(
+        new GetItemCommand({
+          TableName: tableName,
+          Key: { id: { S: 'item1' } },
+          ConsistentRead: true,
+        }),
+      );
+      const payload = res.Item?.payload?.S;
+      if (payload !== 'hello-from-arnica') {
+        throw new Error(
+          `consistent read returned unexpected payload: ${JSON.stringify(payload)}`,
+        );
+      }
+    });
+
+    await check('queryConsistent', async () => {
+      const res = await client.send(
+        new QueryCommand({
+          TableName: tableName,
+          ConsistentRead: true,
+          KeyConditionExpression: 'id = :v',
+          ExpressionAttributeValues: { ':v': { S: 'item1' } },
+        }),
+      );
+      if ((res.Count ?? 0) < 1 || (res.Items?.length ?? 0) < 1) {
+        throw new Error(`consistent query returned no items (Count=${res.Count})`);
+      }
+    });
+
+    await check('batchWriteItem', async () => {
+      await client.send(
+        new BatchWriteItemCommand({
+          RequestItems: {
+            [tableName]: ['batch1', 'batch2', 'batch3'].map((id) => ({
+              PutRequest: {
+                Item: { id: { S: id }, payload: { S: `payload-${id}` } },
+              },
+            })),
+          },
+        }),
+      );
+    });
+
+    // TTL support often reveals Alternator feature gaps on older Scylla versions.
+    await check('updateTimeToLive', async () => {
+      await client.send(
+        new UpdateTimeToLiveCommand({
+          TableName: tableName,
+          TimeToLiveSpecification: {
+            Enabled: true,
+            AttributeName: 'ttl',
+          },
+        }),
+      );
+    });
+
+    await check('deleteTable', async () => {
+      await client.send(new DeleteTableCommand({ TableName: tableName }));
+      tableDeleted = true;
+    });
+  } finally {
+    if (!tableDeleted) {
+      // Best-effort cleanup if the deleteTable step never ran or failed.
+      try {
+        await client.send(new DeleteTableCommand({ TableName: tableName }));
+      } catch {
+        // Ignore — the table may never have been created.
+      }
+    }
+  }
+
+  banner(`== ScyllaDB Compat: ${pass}/${total} PASS ==`);
+
+  if (pass < total) {
+    section('ERROR DIGEST');
+    for (const name of failed) {
+      console.log(`- ${name}`);
+    }
+    console.log(
+      '\nRESULT: FAIL — cluster did not pass the ScyllaDB compatibility checks. Send this entire output to your Arnica contact.',
+    );
+    process.exit(1);
+  }
+
+  console.log(
+    "\nRESULT: PASS — cluster can run Arnica's ScyllaDB workload (QUORUM verified).",
+  );
+  process.exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+async function main(): Promise<void> {
+  banner('ScyllaDB readiness validator');
+  console.log(`endpoint:  ${SCYLLA_ENDPOINT}`);
+  console.log(`timeout:   ${TIMEOUT_SECONDS}s`);
+  console.log(`namespace: ${NAMESPACE}`);
+  console.log(`selector:  ${SCYLLA_SELECTOR}`);
+  console.log(`region:    ${AWS_DEFAULT_REGION}`);
+
+  const client = new DynamoDBClient({
+    endpoint: SCYLLA_ENDPOINT,
+    region: AWS_DEFAULT_REGION,
+    credentials: {
+      accessKeyId: AWS_ACCESS_KEY_ID,
+      secretAccessKey: AWS_SECRET_ACCESS_KEY,
+    },
+  });
+
+  try {
+    const readiness = await waitForAlternator(client);
+    if (!readiness.ready) {
+      await runDiagnosticsAndFail(readiness.lastError);
+    }
+    await runFunctionalTests(client);
+  } finally {
+    client.destroy();
+  }
+}
+
+main().catch((err: unknown) => {
+  console.error(`Unexpected error: ${errorText(err)}`);
+  if (err instanceof Error && err.stack) {
+    console.error(err.stack);
+  }
+  process.exit(1);
+});

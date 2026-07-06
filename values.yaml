@@ -1,10 +1,12 @@
 # -----------------------------------------------------------------------------
 # scylla-readiness-check — preflight / readiness POC chart
 #
-# This chart deploys a single-node ScyllaDB (Bitnami subchart) with the
+# This chart deploys a 3-node ScyllaDB cluster (Bitnami subchart) with the
 # Alternator (DynamoDB-compatible) API enabled, plus a `helm test` validator
-# Job that proves the cluster can run it. It is a proof-of-concept sizing —
-# NOT a production topology.
+# Job that proves the cluster can run it. Three nodes give replication
+# factor 3, so the validator exercises real QUORUM reads/writes (not a
+# single-node RF=1 shortcut). Still a POC sizing — not a tuned production
+# topology.
 #
 # IMPORTANT: ScyllaDB does NOT support NFS-backed storage. Make sure the
 # storage class used below (cluster default when empty) provisions block
@@ -16,7 +18,7 @@ scylladb:
   # Deterministic service DNS: service name "scylladb", Alternator at
   # http://scylladb:8000 — the validator Job depends on this.
   fullnameOverride: scylladb
-  replicaCount: 1                 # POC (prod is 3)
+  replicaCount: 3                 # 3 nodes -> RF3 -> real QUORUM (matches prod)
   resourcesPreset: "small"
   image:
     repository: bitnamilegacy/scylladb
