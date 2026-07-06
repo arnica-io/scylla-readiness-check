@@ -24,7 +24,7 @@ import {
   UpdateTimeToLiveCommand,
   waitUntilTableExists,
 } from '@aws-sdk/client-dynamodb';
-import { CoreV1Api, KubeConfig } from '@kubernetes/client-node';
+import { CoreV1Api, KubeConfig, V1Pod } from '@kubernetes/client-node';
 
 // ---------------------------------------------------------------------------
 // Configuration (env vars provided by the Job, with safe defaults)
@@ -186,46 +186,60 @@ async function printRecentEvents(core: CoreV1Api): Promise<void> {
 }
 
 async function printPodLogs(core: CoreV1Api): Promise<void> {
-  let podNames: string[] = [];
+  // Keep the whole pod object: ScyllaDB pods have multiple containers
+  // (init-sysctl, scylladb, scylladb-jmx-proxy), and readNamespacedPodLog
+  // requires an explicit container name when there is more than one.
+  let pods: V1Pod[] = [];
   try {
     const podList = await core.listNamespacedPod({
       namespace: NAMESPACE,
       labelSelector: SCYLLA_SELECTOR,
     });
-    podNames = podList.items
-      .map((p) => p.metadata?.name)
-      .filter((n): n is string => typeof n === 'string');
+    pods = podList.items;
   } catch (err) {
     console.log(`(failed to list pods for logs: ${errorText(err)})`);
     return;
   }
 
-  for (const name of podNames) {
-    section(`>>> logs: ${name}`);
-    try {
-      const logs = await core.readNamespacedPodLog({
-        name,
-        namespace: NAMESPACE,
-        tailLines: 200,
-      });
-      console.log(logs || '(empty log)');
-    } catch (err) {
-      console.log(`(failed to read logs: ${errorText(err)})`);
-    }
-    // Also try the previous container instance — useful for CrashLoopBackOff.
-    try {
-      const prevLogs = await core.readNamespacedPodLog({
-        name,
-        namespace: NAMESPACE,
-        tailLines: 200,
-        previous: true,
-      });
-      if (prevLogs) {
-        console.log(`>>> previous-instance logs: ${name}`);
-        console.log(prevLogs);
+  for (const pod of pods) {
+    const name = pod.metadata?.name;
+    if (!name) continue;
+    // Every container in the pod, init containers first (that is where the
+    // sysctl setup — a common failure point — runs).
+    const containers = [
+      ...(pod.spec?.initContainers ?? []),
+      ...(pod.spec?.containers ?? []),
+    ].map((c) => c.name);
+
+    for (const container of containers) {
+      section(`>>> logs: ${name} [${container}]`);
+      try {
+        const logs = await core.readNamespacedPodLog({
+          name,
+          namespace: NAMESPACE,
+          container,
+          tailLines: 200,
+        });
+        console.log(logs || '(empty log)');
+      } catch (err) {
+        console.log(`(failed to read logs: ${errorText(err)})`);
       }
-    } catch {
-      // No previous instance — expected for pods that never restarted.
+      // Previous instance too — useful for CrashLoopBackOff.
+      try {
+        const prevLogs = await core.readNamespacedPodLog({
+          name,
+          namespace: NAMESPACE,
+          container,
+          tailLines: 200,
+          previous: true,
+        });
+        if (prevLogs) {
+          console.log(`>>> previous-instance logs: ${name} [${container}]`);
+          console.log(prevLogs);
+        }
+      } catch {
+        // No previous instance — expected for containers that never restarted.
+      }
     }
   }
 }

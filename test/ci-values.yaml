@@ -17,7 +17,10 @@ scylladb:
     limits:
       cpu: "2"
       memory: 2Gi
-  # Single seed node + developer mode so ScyllaDB starts on a small runner.
+  # Single seed node, constrained to fit a small runner. The Bitnami image
+  # already injects `--developer-mode true`; we only cap CPU/memory here.
+  # NOTE: `--overprovisioned` is a bare boolean flag — passing it a value
+  # ("--overprovisioned=1") makes ScyllaDB refuse to start.
   command:
     - bash
     - -ec
@@ -26,7 +29,7 @@ scylladb:
       export SCYLLADB_BROADCAST_ADDRESS=${POD_NAME}-internal
       /opt/bitnami/scripts/scylladb/entrypoint.sh /opt/bitnami/scripts/scylladb/run.sh \
         --alternator-port=8000 --alternator-write-isolation=always \
-        --developer-mode=1 --smp=1 --memory=1G --overprovisioned=1
+        --smp=1 --memory=1G --overprovisioned
 
 validator:
   # Image is built and `kind load`-ed by the CI job, so pull from the node.
