@@ -19,14 +19,26 @@ scylladb:
   # http://scylladb:8000 — the validator Job depends on this.
   fullnameOverride: scylladb
   replicaCount: 3                 # 3 nodes -> RF3 -> real QUORUM (matches prod)
-  resourcesPreset: "small"
+  # Matches kube-arnica-stack. Smaller presets starve ScyllaDB's seastar
+  # engine (insufficient memory) and it fails to boot — do not shrink below
+  # "medium" without also tuning --memory/--smp/--reserve-memory.
+  resourcesPreset: "medium"
   image:
     repository: bitnamilegacy/scylladb
+    # Verbose Bitnami startup logging, on by default for this POC so that a
+    # failed ScyllaDB boot is visible in `kubectl logs` and the validator's
+    # diagnostics packet. Set to false for quieter output.
+    debug: true
   persistence:
-    # Empty = cluster default storage class. NFS is unsupported by ScyllaDB —
-    # use a block-storage class.
+    # IMPORTANT: ScyllaDB requires high-performance BLOCK storage. NFS is NOT
+    # supported and will cause failures/poor performance.
+    #   ""  -> cluster default storage class (recommended for the POC)
+    #   "-" -> storageClassName: "" (disables dynamic provisioning)
+    # On-prem block options: longhorn, rook-ceph-block, local-path,
+    # openebs-cstor, or a direct-attached class. Override with
+    #   --set scylladb.persistence.storageClass=<your-block-sc>
     storageClass: ""
-    size: 10Gi
+    size: 30Gi
   sysctl:
     enabled: true
     image:
@@ -71,7 +83,8 @@ scylladb:
 
 # Validator Job run by `helm test` — exercises the Alternator API end to end.
 validator:
-  image: ghcr.io/arnica-io/scylla-readiness-validator:0.1.0
+  # Tag is kept in lockstep with the chart release by the release workflow.
+  image: ghcr.io/arnica-io/scylla-readiness-validator:0.1.3
   imagePullPolicy: IfNotPresent
   # How long the validator waits for ScyllaDB to come up and the checks to pass.
   timeoutSeconds: 1200

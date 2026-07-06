@@ -57,6 +57,11 @@ jobs:
             --username "$GHCR_USER" \
             --password-stdin
 
+      - name: Pin validator image tag to this release
+        run: |
+          sed -i -E "s#(scylla-readiness-validator):[0-9A-Za-z._-]+#\1:${VERSION}#" values.yaml
+          grep -n "scylla-readiness-validator:" values.yaml
+
       - name: Package chart
         run: helm package . --version "${VERSION}" --app-version "${VERSION}"
 
