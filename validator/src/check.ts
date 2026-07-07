@@ -36,6 +36,7 @@ const TIMEOUT_SECONDS = parseInt(process.env.TIMEOUT_SECONDS ?? '1200', 10);
 const SCYLLA_SELECTOR =
   process.env.SCYLLA_SELECTOR ?? 'app.kubernetes.io/name=scylladb';
 const NAMESPACE = process.env.NAMESPACE ?? 'default';
+const RELEASE_NAME = process.env.RELEASE_NAME ?? 'rc';
 // Alternator requires credentials to be present but accepts any value.
 const AWS_ACCESS_KEY_ID = process.env.AWS_ACCESS_KEY_ID ?? 'readiness';
 const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY ?? 'readiness';
@@ -79,6 +80,14 @@ function errorText(err: unknown): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Printed at the end of every run so the user always sees how to tear down.
+function printCleanup(): void {
+  section('Clean up when you are done');
+  console.log('Remove everything this chart created:');
+  console.log(`    helm uninstall ${RELEASE_NAME} -n ${NAMESPACE}`);
+  console.log(`    kubectl delete namespace ${NAMESPACE}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +426,7 @@ async function runDiagnosticsAndFail(
   banner(
     `RESULT: FAIL — ${why}. Send this entire output (or the collect-diagnostics.sh bundle) to your Arnica contact.`,
   );
+  printCleanup();
   process.exit(1);
 }
 
@@ -579,11 +589,13 @@ async function runFunctionalTests(
     console.log(
       '\nRESULT: FAIL — cluster did not pass the ScyllaDB compatibility checks. Send this entire output to your Arnica contact.',
     );
+    printCleanup();
     process.exit(1);
   }
 
   console.log("\nRESULT: PASS — cluster can run Arnica's ScyllaDB workload.");
   console.log(`Topology: ${topologyLine(health)}.`);
+  printCleanup();
   process.exit(0);
 }
 
