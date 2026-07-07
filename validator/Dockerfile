@@ -8,7 +8,7 @@
 # natively (not under QEMU emulation) during multi-arch builds. The runtime
 # deps are pure JavaScript (no native addons), so the resulting node_modules
 # is architecture-agnostic and safe to copy into any target-arch runtime.
-FROM --platform=$BUILDPLATFORM node:20-alpine AS build
+FROM --platform=$BUILDPLATFORM node:22-alpine AS build
 WORKDIR /app
 
 COPY package.json package-lock.json ./
@@ -22,7 +22,7 @@ RUN npm run build
 RUN npm prune --omit=dev
 
 # ---- Stage 2: runtime ----
-FROM node:20-alpine
+FROM node:22-alpine
 WORKDIR /app
 
 COPY --from=build /app/node_modules ./node_modules

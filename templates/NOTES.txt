@@ -1,17 +1,24 @@
 Thank you for installing {{ .Chart.Name }}.
 
-ScyllaDB is now starting up. To run the readiness check, copy and paste
-this command:
+ScyllaDB is now starting up — a fresh {{ .Values.scylladb.replicaCount }}-node
+cluster can take a few minutes on first boot. You can watch it become ready:
 
-    helm test {{ .Release.Name }} -n {{ .Release.Namespace }} --logs
+    kubectl get pods -n {{ .Release.Namespace }} -w
 
-This will print a PASS/FAIL summary of the check. If ScyllaDB did not come
-up within {{ .Values.validator.timeoutSeconds }} seconds, it prints the startup
-logs instead so we can see what went wrong.
+When the scylladb pods are Ready, run the readiness check. IMPORTANT: pass
+--timeout so `helm test` waits at least as long as the validator does
+({{ .Values.validator.timeoutSeconds }}s) — without it, helm aborts after its
+default 5 minutes:
 
-Please copy the full output of that command and send it to your Arnica
-contact.
+    helm test {{ .Release.Name }} -n {{ .Release.Namespace }} --logs --timeout {{ add (div .Values.validator.timeoutSeconds 60) 5 }}m
+
+This prints a PASS/FAIL summary. If ScyllaDB did not come up in time, it prints
+the startup diagnostics (pod status, events, and the ScyllaDB boot log)
+instead, so we can see what went wrong.
+
+Please copy the full output of that command and send it to your Arnica contact.
 
 When you are done, clean everything up with:
 
     helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}
+    kubectl delete namespace {{ .Release.Namespace }}
