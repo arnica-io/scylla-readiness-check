@@ -1,11 +1,12 @@
 Thank you for installing {{ .Chart.Name }}.
 
-ScyllaDB is now starting up — a fresh {{ .Values.scylladb.replicaCount }}-node
-cluster can take a few minutes on first boot. You can watch it become ready:
+ScyllaDB is now starting up. Nodes start ONE AT A TIME, and each can take
+~6-8 minutes on first boot, so a fresh {{ .Values.scylladb.replicaCount }}-node cluster
+often needs ~18-24 minutes to be fully Ready. That is normal. Watch progress:
 
     kubectl get pods -n {{ .Release.Namespace }} -w
 
-When the scylladb pods are Ready, run the readiness check. IMPORTANT: pass
+When all scylladb pods show Ready, run the readiness check. IMPORTANT: pass
 --timeout so `helm test` waits at least as long as the validator does
 ({{ .Values.validator.timeoutSeconds }}s) — without it, helm aborts after its
 default 5 minutes:

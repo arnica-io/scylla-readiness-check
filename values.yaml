@@ -94,8 +94,11 @@ validator:
   # Tag is kept in lockstep with the chart release by the release workflow.
   image: ghcr.io/arnica-io/scylla-readiness-validator:0.1.3
   imagePullPolicy: IfNotPresent
-  # How long the validator waits for ScyllaDB to come up and the checks to pass.
-  timeoutSeconds: 1200
+  # How long the validator waits for the FULL cluster to be Ready before the
+  # checks run. ScyllaDB nodes start one at a time (StatefulSet) and each can
+  # take ~6-8 min on first boot, so a 3-node cluster needs ~18-24 min. Default
+  # 40 min leaves headroom; raise it for slow storage or more nodes.
+  timeoutSeconds: 2400
   resources:
     requests:
       cpu: 50m

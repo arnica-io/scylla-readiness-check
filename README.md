@@ -30,13 +30,13 @@ Run these three steps. The whole check typically completes in a few minutes.
 helm install rc oci://ghcr.io/arnica-io/scylla-readiness-check -n scylla-readiness --create-namespace
 ```
 
-**2. Run the readiness test** (this is where the results appear — the `--logs` flag prints the full report to your terminal). The `--timeout` must be at least as long as the validator's wait (`validator.timeoutSeconds`, default 1200s / 20m), or `helm test` aborts after its own 5-minute default:
+**2. Run the readiness test** (this is where the results appear — the `--logs` flag prints the full report to your terminal). The `--timeout` must be at least as long as the validator's wait (`validator.timeoutSeconds`, default 2400s / 40m), or `helm test` aborts after its own 5-minute default:
 
 ```bash
-helm test rc -n scylla-readiness --logs --timeout 25m
+helm test rc -n scylla-readiness --logs --timeout 45m
 ```
 
-> First boot of a 3-node cluster takes a few minutes. Watch `kubectl get pods -n scylla-readiness` until the `scylladb-*` pods are Ready before (or while) running the test.
+> **First boot is slow.** ScyllaDB nodes start one at a time and each can take ~6-8 minutes, so a fresh 3-node cluster often needs ~18-24 minutes to be fully Ready — this is normal. Watch `kubectl get pods -n scylla-readiness` until all `scylladb-*` pods are Ready before (or while) running the test.
 
 **3. Clean up when you're done:**
 
