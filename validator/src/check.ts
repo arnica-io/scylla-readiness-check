@@ -24,7 +24,7 @@ import {
   UpdateTimeToLiveCommand,
   waitUntilTableExists,
 } from '@aws-sdk/client-dynamodb';
-import { CoreV1Api, Exec, KubeConfig, V1Pod } from '@kubernetes/client-node';
+import { AppsV1Api, CoreV1Api, Exec, KubeConfig, V1Pod } from '@kubernetes/client-node';
 import { Writable } from 'node:stream';
 
 // ---------------------------------------------------------------------------
@@ -361,8 +361,15 @@ async function runDiagnosticsAndFail(lastError: unknown): Promise<never> {
 // PHASE 2b — functional DynamoDB tests at QUORUM
 // ---------------------------------------------------------------------------
 
-async function runFunctionalTests(client: DynamoDBClient): Promise<never> {
+async function runFunctionalTests(
+  client: DynamoDBClient,
+  kc: KubeConfig,
+): Promise<never> {
   banner('PHASE 2 — functional DynamoDB (Alternator) tests at QUORUM');
+
+  // Surface cluster topology/health first — a degraded cluster (Ready < quorum)
+  // is why the QUORUM tests below may fail, so report it up front.
+  const health = await reportClusterHealth(kc);
 
   const tableName = `readiness_check_${Date.now()}`;
   console.log(`Using test table: ${tableName}`);
@@ -499,53 +506,92 @@ async function runFunctionalTests(client: DynamoDBClient): Promise<never> {
     for (const name of failed) {
       console.log(`- ${name}`);
     }
+    if (health.known && health.desired > 0 && health.ready < health.quorum) {
+      console.log(
+        `\nLikely cause: only ${health.ready}/${health.desired} ScyllaDB nodes ` +
+          `are Ready (QUORUM needs ${health.quorum}). Bring the missing ` +
+          `node(s) up — see the diagnostics above — then re-run.`,
+      );
+    }
     console.log(
       '\nRESULT: FAIL — cluster did not pass the ScyllaDB compatibility checks. Send this entire output to your Arnica contact.',
     );
     process.exit(1);
   }
 
-  // Report the real topology so the quorum claim is honest: a consistent
-  // read on a single node (RF1) is only a trivial quorum-of-one.
-  const nodes = await countReadyScyllaNodes();
-  let topology: string;
-  if (nodes === null) {
-    topology = 'node count unknown (could not query the Kubernetes API)';
-  } else if (nodes >= 3) {
-    topology = `${nodes} nodes — QUORUM verified (RF3, tolerates 1 node loss)`;
-  } else if (nodes === 2) {
-    topology = `${nodes} nodes — quorum active (RF2, no failure tolerance)`;
-  } else {
-    topology = `${nodes} node — single-node (RF1); QUORUM was NOT exercised`;
-  }
-
   console.log("\nRESULT: PASS — cluster can run Arnica's ScyllaDB workload.");
-  console.log(`Topology: ${topology}.`);
+  console.log(`Topology: ${topologyLine(health)}.`);
   process.exit(0);
 }
 
-// Count ScyllaDB pods that are Ready, to report the real topology in the
-// PASS summary. Returns null if the Kubernetes API cannot be reached.
-async function countReadyScyllaNodes(): Promise<number | null> {
+// Honest one-line topology summary based on desired-vs-ready nodes.
+function topologyLine(h: ClusterHealth): string {
+  if (!h.known || h.desired === 0) return 'node count unknown';
+  if (h.ready < h.desired) {
+    return `DEGRADED — ${h.ready}/${h.desired} nodes Ready (quorum ${h.quorum})`;
+  }
+  if (h.desired >= 3) {
+    return `${h.ready}/${h.desired} nodes Ready — QUORUM verified (tolerates ${h.desired - h.quorum} node loss)`;
+  }
+  if (h.desired === 2) return `2/2 nodes Ready — quorum active, no fault tolerance`;
+  return `single-node (RF1) — QUORUM not exercised`;
+}
+
+interface ClusterHealth {
+  desired: number; // ScyllaDB nodes the StatefulSet wants
+  ready: number; // nodes actually Ready
+  quorum: number; // nodes required for a QUORUM operation
+  known: boolean; // false if the StatefulSet could not be read
+}
+
+// Read desired-vs-ready ScyllaDB nodes from the StatefulSet. A cluster with
+// fewer Ready nodes than desired is DEGRADED — and if Ready < quorum, every
+// QUORUM read/write will fail. This is a common on-prem finding, so we report
+// it explicitly and, when degraded, dump why the missing nodes are down.
+async function reportClusterHealth(kc: KubeConfig): Promise<ClusterHealth> {
+  const apps = kc.makeApiClient(AppsV1Api);
+  const core = kc.makeApiClient(CoreV1Api);
+  let desired = 0;
+  let ready = 0;
+  section('ScyllaDB cluster health');
   try {
-    const kc = new KubeConfig();
-    kc.loadFromCluster();
-    const core = kc.makeApiClient(CoreV1Api);
-    const podList = await core.listNamespacedPod({
+    const list = await apps.listNamespacedStatefulSet({
       namespace: NAMESPACE,
       labelSelector: SCYLLA_SELECTOR,
     });
-    let ready = 0;
-    for (const pod of podList.items) {
-      const isReady = (pod.status?.conditions ?? []).some(
-        (c) => c.type === 'Ready' && c.status === 'True',
-      );
-      if (isReady) ready++;
+    for (const sts of list.items) {
+      desired += sts.spec?.replicas ?? 0;
+      ready += sts.status?.readyReplicas ?? 0;
     }
-    return ready;
-  } catch {
-    return null;
+  } catch (err) {
+    console.log(`(could not read ScyllaDB StatefulSet: ${errorText(err)})`);
+    return { desired: 0, ready: 0, quorum: 0, known: false };
   }
+
+  const quorum = desired > 0 ? Math.floor(desired / 2) + 1 : 0;
+  console.log(`ScyllaDB nodes Ready: ${ready}/${desired}   (QUORUM needs ${quorum})`);
+
+  if (desired > 0 && ready < desired) {
+    const down = desired - ready;
+    if (ready < quorum) {
+      console.log(
+        `WARNING: ${down} of ${desired} ScyllaDB node(s) are NOT Ready. ` +
+          `Only ${ready} up — below QUORUM (${quorum}). QUORUM reads/writes ` +
+          `WILL FAIL until at least ${quorum} nodes are Ready.`,
+      );
+    } else {
+      console.log(
+        `WARNING: ${down} of ${desired} ScyllaDB node(s) are NOT Ready. ` +
+          `Quorum (${quorum}) is still met, but the cluster is degraded and ` +
+          `has no fault tolerance.`,
+      );
+    }
+    // Show why the missing nodes are down.
+    await printPodStatuses(core);
+    await printScyllaBootLogs(kc, core);
+  }
+
+  return { desired, ready, quorum, known: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -569,12 +615,19 @@ async function main(): Promise<void> {
     },
   });
 
+  const kc = new KubeConfig();
+  try {
+    kc.loadFromCluster(); // in-cluster ServiceAccount token (RBAC granted by the chart)
+  } catch (err) {
+    console.log(`(could not load in-cluster Kubernetes config: ${errorText(err)})`);
+  }
+
   try {
     const readiness = await waitForAlternator(client);
     if (!readiness.ready) {
       await runDiagnosticsAndFail(readiness.lastError);
     }
-    await runFunctionalTests(client);
+    await runFunctionalTests(client, kc);
   } finally {
     client.destroy();
   }
