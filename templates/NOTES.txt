@@ -18,6 +18,12 @@ instead, so we can see what went wrong.
 
 Please copy the full output of that command and send it to your Arnica contact.
 
+If ScyllaDB keeps crashing or the check fails, collect a full diagnostics
+bundle (Kubernetes objects, events, and ScyllaDB logs — no application data)
+and send it back:
+
+    curl -fsSL https://raw.githubusercontent.com/arnica-io/scylla-readiness-check/main/test/collect-diagnostics.sh | bash -s -- -n {{ .Release.Namespace }} -r {{ .Release.Name }}
+
 When you are done, clean everything up with:
 
     helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}

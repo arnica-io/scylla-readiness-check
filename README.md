@@ -76,6 +76,21 @@ helm install rc oci://ghcr.io/arnica-io/scylla-readiness-check \
   --set scylladb.persistence.storageClass=fast-ssd
 ```
 
+## If something goes wrong — send diagnostics
+
+If the check fails or ScyllaDB keeps crashing, the `helm test --logs` output
+already includes a diagnostics packet (pod status, events, ScyllaDB boot logs).
+For a complete bundle to send back to Arnica, run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/arnica-io/scylla-readiness-check/main/test/collect-diagnostics.sh \
+  | bash -s -- -n scylla-readiness -r rc
+```
+
+This writes `scylla-readiness-diagnostics-*.tgz` — Kubernetes objects, events,
+and ScyllaDB logs only (no application data). Review it if cluster names are
+sensitive, then send it to your Arnica contact.
+
 ## Cleanup / offboarding
 
 ```bash
