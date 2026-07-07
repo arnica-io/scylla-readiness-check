@@ -59,6 +59,14 @@ scylladb:
         nodePort: null
   cluster:
     seedCount: 1
+  # ScyllaDB/seastar creates one shard per CPU core it SEES — which is the
+  # node's core count, not the pod's CPU limit. On a high-core node (e.g. 36
+  # cores) it spawns 36 shards and splits the pod's memory across them, giving
+  # each shard too little and failing at startup with:
+  #   Startup failed: logalloc::bad_alloc (failed to allocate segment ...)
+  # Pinning --smp caps the shard count so the DB boots regardless of node size.
+  # This is a portability choice for the POC (compat, not perf); prospects can
+  # raise --smp for a performance test if the pod is given more CPU/memory.
   command:
     - bash
     - -ec
@@ -70,7 +78,7 @@ scylladb:
           export SCYLLADB_IGNORE_INITDB_SCRIPTS=1
       fi
       export SCYLLADB_BROADCAST_ADDRESS=${POD_NAME}-internal
-      /opt/bitnami/scripts/scylladb/entrypoint.sh /opt/bitnami/scripts/scylladb/run.sh --alternator-port=8000 --alternator-write-isolation=always
+      /opt/bitnami/scripts/scylladb/entrypoint.sh /opt/bitnami/scripts/scylladb/run.sh --alternator-port=8000 --alternator-write-isolation=always --smp=1 --overprovisioned --reserve-memory=0M
   affinity:
     podAntiAffinity:
       preferredDuringSchedulingIgnoredDuringExecution:
