@@ -62,6 +62,18 @@ function errorText(err: unknown): string {
   if (err instanceof Error) {
     return `${err.name}: ${err.message}`;
   }
+  if (err && typeof err === 'object') {
+    // Kubernetes client / websocket errors are plain objects — surface the
+    // useful fields instead of "[object Object]".
+    const o = err as Record<string, unknown>;
+    const msg = o.message ?? o.reason ?? o.statusMessage ?? o.body ?? o.code;
+    if (msg !== undefined) return typeof msg === 'string' ? msg : JSON.stringify(msg);
+    try {
+      return JSON.stringify(err);
+    } catch {
+      return String(err);
+    }
+  }
   return String(err);
 }
 
@@ -75,40 +87,75 @@ function sleep(ms: number): Promise<void> {
 
 interface ReadinessResult {
   ready: boolean;
+  alternatorReachable: boolean;
   lastError: unknown;
   elapsedSeconds: number;
+  health: ClusterHealth;
 }
 
-async function waitForAlternator(client: DynamoDBClient): Promise<ReadinessResult> {
+// Wait until BOTH the Alternator API answers AND every ScyllaDB node the
+// StatefulSet wants is Ready. Testing as soon as a single node answers would
+// pass trivially (that node's keyspace is RF1 → "QUORUM" of one), giving false
+// confidence — so we hold until the full cluster is up (or time out and fail).
+async function waitForCluster(
+  client: DynamoDBClient,
+  kc: KubeConfig,
+): Promise<ReadinessResult> {
   banner(
-    `PHASE 1 — waiting up to ${TIMEOUT_SECONDS}s for ScyllaDB Alternator at ${SCYLLA_ENDPOINT}`,
+    `PHASE 1 — waiting up to ${TIMEOUT_SECONDS}s for ScyllaDB Alternator + all nodes Ready`,
   );
 
   const start = Date.now();
   let lastError: unknown = null;
-  let lastHeartbeat = 0;
+  let lastHeartbeat = -HEARTBEAT_EVERY_MS;
+  let alternatorReachable = false;
+  let health: ClusterHealth = { desired: 0, ready: 0, quorum: 0, known: false };
 
   for (;;) {
     const elapsedMs = Date.now() - start;
     const elapsedSeconds = Math.floor(elapsedMs / 1000);
 
     if (elapsedSeconds >= TIMEOUT_SECONDS) {
-      return { ready: false, lastError, elapsedSeconds };
+      return { ready: false, alternatorReachable, lastError, elapsedSeconds, health };
     }
 
+    let alternatorOk = false;
     try {
       await client.send(new ListTablesCommand({ Limit: 1 }));
-      console.log(`[PASS] alternator-reachable (after ${elapsedSeconds}s)`);
-      return { ready: true, lastError: null, elapsedSeconds };
+      alternatorOk = true;
+      alternatorReachable = true;
     } catch (err) {
       lastError = err;
+    }
+
+    health = await getClusterHealth(kc);
+
+    // Ready when Alternator answers AND all desired nodes are Ready. If node
+    // health can't be read (RBAC/API issue), fall back to Alternator-only so
+    // we don't hang forever — the topology line will note it's unknown.
+    const nodesReady =
+      !health.known || (health.desired > 0 && health.ready >= health.desired);
+    if (alternatorOk && nodesReady) {
+      const detail = health.known
+        ? `all ${health.desired} node(s) Ready`
+        : 'node count unknown';
+      console.log(
+        `[PASS] alternator-reachable and ${detail} (after ${elapsedSeconds}s)`,
+      );
+      return { ready: true, alternatorReachable: true, lastError: null, elapsedSeconds, health };
     }
 
     if (elapsedMs - lastHeartbeat >= HEARTBEAT_EVERY_MS) {
       lastHeartbeat = elapsedMs;
       const remaining = TIMEOUT_SECONDS - elapsedSeconds;
+      const altInfo = alternatorOk
+        ? 'alternator OK'
+        : `alternator not ready (${errorText(lastError)})`;
+      const nodeInfo = health.known
+        ? `nodes Ready ${health.ready}/${health.desired}`
+        : 'node count unknown';
       console.log(
-        `... still waiting for ScyllaDB (elapsed ${elapsedSeconds}s, remaining ${remaining}s) — last error: ${errorText(lastError)}`,
+        `... waiting (elapsed ${elapsedSeconds}s, remaining ${remaining}s) — ${altInfo}; ${nodeInfo}`,
       );
     }
 
@@ -332,15 +379,28 @@ async function printScyllaBootLogs(
   }
 }
 
-async function runDiagnosticsAndFail(lastError: unknown): Promise<never> {
-  banner(`SCYLLA DID NOT BECOME READY IN ${TIMEOUT_SECONDS}s — DIAGNOSTICS`);
-  console.log(`Last ListTables error: ${errorText(lastError)}`);
+async function runDiagnosticsAndFail(
+  kc: KubeConfig,
+  r: ReadinessResult,
+): Promise<never> {
+  const { alternatorReachable, health } = r;
+  // Two distinct failure modes, reported plainly:
+  if (!alternatorReachable) {
+    banner(`SCYLLA ALTERNATOR DID NOT ANSWER IN ${TIMEOUT_SECONDS}s — DIAGNOSTICS`);
+    console.log(`Last Alternator error: ${errorText(r.lastError)}`);
+  } else {
+    banner(`SCYLLA CLUSTER DID NOT REACH FULL READINESS IN ${TIMEOUT_SECONDS}s — DIAGNOSTICS`);
+    if (health.known) {
+      console.log(
+        `Only ${health.ready}/${health.desired} ScyllaDB node(s) became Ready. ` +
+          `A full ${health.desired}-node cluster is required to verify QUORUM.`,
+      );
+    }
+  }
 
   try {
-    const kc = new KubeConfig();
-    kc.loadFromCluster(); // in-cluster ServiceAccount token (RBAC granted by the chart)
     const core = kc.makeApiClient(CoreV1Api);
-
+    await reportClusterHealth(kc);
     await printPodStatuses(core);
     await printRecentEvents(core);
     await printPodLogs(core);
@@ -348,11 +408,14 @@ async function runDiagnosticsAndFail(lastError: unknown): Promise<never> {
     // container logs above rarely show WHY it failed. Exec in and read it.
     await printScyllaBootLogs(kc, core);
   } catch (err) {
-    console.log(`(failed to initialize Kubernetes client: ${errorText(err)})`);
+    console.log(`(failed to gather Kubernetes diagnostics: ${errorText(err)})`);
   }
 
+  const why = alternatorReachable
+    ? `only ${health.ready}/${health.desired} nodes Ready`
+    : 'ScyllaDB Alternator never answered';
   banner(
-    'RESULT: FAIL — ScyllaDB did not start. Send this entire output to your Arnica contact.',
+    `RESULT: FAIL — ${why}. Send this entire output (or the collect-diagnostics.sh bundle) to your Arnica contact.`,
   );
   process.exit(1);
 }
@@ -548,12 +611,11 @@ interface ClusterHealth {
 // fewer Ready nodes than desired is DEGRADED — and if Ready < quorum, every
 // QUORUM read/write will fail. This is a common on-prem finding, so we report
 // it explicitly and, when degraded, dump why the missing nodes are down.
-async function reportClusterHealth(kc: KubeConfig): Promise<ClusterHealth> {
+// Quiet read of desired-vs-ready ScyllaDB nodes from the StatefulSet.
+async function getClusterHealth(kc: KubeConfig): Promise<ClusterHealth> {
   const apps = kc.makeApiClient(AppsV1Api);
-  const core = kc.makeApiClient(CoreV1Api);
   let desired = 0;
   let ready = 0;
-  section('ScyllaDB cluster health');
   try {
     const list = await apps.listNamespacedStatefulSet({
       namespace: NAMESPACE,
@@ -563,12 +625,22 @@ async function reportClusterHealth(kc: KubeConfig): Promise<ClusterHealth> {
       desired += sts.spec?.replicas ?? 0;
       ready += sts.status?.readyReplicas ?? 0;
     }
-  } catch (err) {
-    console.log(`(could not read ScyllaDB StatefulSet: ${errorText(err)})`);
+  } catch {
     return { desired: 0, ready: 0, quorum: 0, known: false };
   }
-
   const quorum = desired > 0 ? Math.floor(desired / 2) + 1 : 0;
+  return { desired, ready, quorum, known: true };
+}
+
+async function reportClusterHealth(kc: KubeConfig): Promise<ClusterHealth> {
+  const core = kc.makeApiClient(CoreV1Api);
+  section('ScyllaDB cluster health');
+  const health = await getClusterHealth(kc);
+  const { desired, ready, quorum, known } = health;
+  if (!known) {
+    console.log('(could not read ScyllaDB StatefulSet)');
+    return health;
+  }
   console.log(`ScyllaDB nodes Ready: ${ready}/${desired}   (QUORUM needs ${quorum})`);
 
   if (desired > 0 && ready < desired) {
@@ -591,7 +663,7 @@ async function reportClusterHealth(kc: KubeConfig): Promise<ClusterHealth> {
     await printScyllaBootLogs(kc, core);
   }
 
-  return { desired, ready, quorum, known: true };
+  return health;
 }
 
 // ---------------------------------------------------------------------------
@@ -623,9 +695,9 @@ async function main(): Promise<void> {
   }
 
   try {
-    const readiness = await waitForAlternator(client);
+    const readiness = await waitForCluster(client, kc);
     if (!readiness.ready) {
-      await runDiagnosticsAndFail(readiness.lastError);
+      await runDiagnosticsAndFail(kc, readiness);
     }
     await runFunctionalTests(client, kc);
   } finally {
