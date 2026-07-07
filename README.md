@@ -20,6 +20,8 @@ At the end you get a clear **PASS/FAIL summary** in your terminal. You copy that
   - `docker.io` (the `bitnamilegacy/scylladb` database image)
 - A **StorageClass backed by block storage** (e.g. local SSD, EBS, Ceph RBD, vSphere volumes). **NFS is not supported** — ScyllaDB requires block storage.
 
+> The ScyllaDB (Bitnami) subchart is **vendored inside this chart**, so no Bitnami or Helm-repository access is needed at install time — your cluster only needs to pull container images from `ghcr.io` and `docker.io`.
+
 ## Quick start
 
 Run these three steps. The whole check typically completes in a few minutes.
