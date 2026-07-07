@@ -24,7 +24,8 @@ import {
   UpdateTimeToLiveCommand,
   waitUntilTableExists,
 } from '@aws-sdk/client-dynamodb';
-import { CoreV1Api, KubeConfig, V1Pod } from '@kubernetes/client-node';
+import { CoreV1Api, Exec, KubeConfig, V1Pod } from '@kubernetes/client-node';
+import { Writable } from 'node:stream';
 
 // ---------------------------------------------------------------------------
 // Configuration (env vars provided by the Job, with safe defaults)
@@ -244,6 +245,93 @@ async function printPodLogs(core: CoreV1Api): Promise<void> {
   }
 }
 
+// Run a command in a pod container and collect its combined stdout/stderr.
+// Resolves with whatever was captured (never rejects) so diagnostics are
+// best-effort. Bounded by a timeout so a stuck exec cannot hang the run.
+function execInPod(
+  kc: KubeConfig,
+  pod: string,
+  container: string,
+  command: string[],
+): Promise<string> {
+  return new Promise((resolve) => {
+    let out = '';
+    const sink = new Writable({
+      write(chunk, _enc, cb) {
+        out += chunk.toString();
+        cb();
+      },
+    });
+    let settled = false;
+    const done = (): void => {
+      if (!settled) {
+        settled = true;
+        resolve(out.trim() || '(no output)');
+      }
+    };
+    const timer = setTimeout(() => {
+      out += '\n(exec timed out)';
+      done();
+    }, 15000);
+    try {
+      new Exec(kc)
+        .exec(NAMESPACE, pod, container, command, sink, sink, null, false)
+        .then((ws) => {
+          ws.on('close', () => {
+            clearTimeout(timer);
+            done();
+          });
+          ws.on('error', () => {
+            clearTimeout(timer);
+            done();
+          });
+        })
+        .catch((err: unknown) => {
+          clearTimeout(timer);
+          out += `\n(exec failed: ${errorText(err)})`;
+          done();
+        });
+    } catch (err) {
+      clearTimeout(timer);
+      out += `\n(exec failed: ${errorText(err)})`;
+      done();
+    }
+  });
+}
+
+// ScyllaDB (via the Bitnami image) writes boot progress and errors to a log
+// file, not stdout. On failure, exec into each ScyllaDB pod and print that
+// file — it contains the actual reason boot stalled (seastar/memory/schema).
+async function printScyllaBootLogs(
+  kc: KubeConfig,
+  core: CoreV1Api,
+): Promise<void> {
+  let pods: V1Pod[] = [];
+  try {
+    const podList = await core.listNamespacedPod({
+      namespace: NAMESPACE,
+      labelSelector: SCYLLA_SELECTOR,
+    });
+    pods = podList.items;
+  } catch (err) {
+    console.log(`(failed to list pods for boot logs: ${errorText(err)})`);
+    return;
+  }
+
+  const bootLog = '/opt/bitnami/scylladb/logs/scylladb_first_boot.log';
+  for (const pod of pods) {
+    const name = pod.metadata?.name;
+    if (!name) continue;
+    section(`>>> ScyllaDB boot log: ${name} (${bootLog})`);
+    const output = await execInPod(kc, name, 'scylladb', [
+      'sh',
+      '-c',
+      `tail -n 200 ${bootLog} 2>/dev/null || echo "(boot log not found — ScyllaDB may not have reached first boot)"`,
+    ]);
+    console.log(output);
+  }
+}
+
 async function runDiagnosticsAndFail(lastError: unknown): Promise<never> {
   banner(`SCYLLA DID NOT BECOME READY IN ${TIMEOUT_SECONDS}s — DIAGNOSTICS`);
   console.log(`Last ListTables error: ${errorText(lastError)}`);
@@ -256,6 +344,9 @@ async function runDiagnosticsAndFail(lastError: unknown): Promise<never> {
     await printPodStatuses(core);
     await printRecentEvents(core);
     await printPodLogs(core);
+    // ScyllaDB writes its boot progress/errors to a file, not stdout, so the
+    // container logs above rarely show WHY it failed. Exec in and read it.
+    await printScyllaBootLogs(kc, core);
   } catch (err) {
     console.log(`(failed to initialize Kubernetes client: ${errorText(err)})`);
   }

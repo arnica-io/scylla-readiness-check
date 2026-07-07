@@ -18,6 +18,13 @@ rules:
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
     verbs: ["get", "list"]
+  # exec is used ONLY by the validator, and ONLY on timeout, to read
+  # ScyllaDB's boot log (scylladb_first_boot.log) which Bitnami writes to a
+  # file rather than stdout. This grant is namespaced to the release and is
+  # removed by `helm uninstall` — it exists only for the testing period.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
