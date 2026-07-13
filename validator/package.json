@@ -11,11 +11,11 @@
     "start": "node dist/check.js"
   },
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-dynamodb": "^3.1085.0",
     "@kubernetes/client-node": "^1.0.0"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "typescript": "^6.0.3"
+    "@types/node": "^22.20.1",
+    "typescript": "^7.0.2"
   }
 }
